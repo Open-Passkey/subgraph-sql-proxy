@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/sql.js": {
-      "runtime": "@vercel/edge"
-    }
-  }
-}
+{}
