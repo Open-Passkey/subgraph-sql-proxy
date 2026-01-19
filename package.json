@@ -1,6 +1,9 @@
 {
   "name": "subgraph-sql-proxy",
   "version": "1.0.0",
-  "description": "CORS proxy for Coinbase SQL API",
-  "private": true
+  "description": "CORS proxy for Coinbase SQL API with JWT authentication",
+  "private": true,
+  "dependencies": {
+    "jose": "^5.2.0"
+  }
 }

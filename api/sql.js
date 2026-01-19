@@ -1,7 +1,7 @@
 // Vercel Edge Function to proxy Coinbase SQL API requests with JWT authentication
-// Set these environment variables in Vercel:
-// - CDP_KEY_NAME: Your CDP API key ID (e.g., "06e27a55-d5f5-4e93-9e16-b33be1493380")
-// - CDP_PRIVATE_KEY: Your CDP private key (base64 string from downloaded JSON)
+// Using jose library (same as Coinbase SDK)
+
+import { SignJWT, importJWK } from 'jose';
 
 export const config = {
   runtime: 'edge',
@@ -10,11 +10,6 @@ export const config = {
 const COINBASE_SQL_API = 'https://api.cdp.coinbase.com/platform/v2/data/query/run';
 const API_HOST = 'api.cdp.coinbase.com';
 
-// Base64 to Base64URL conversion
-function base64ToBase64Url(base64) {
-  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
-
 // Generate random hex nonce
 function generateNonce() {
   const bytes = new Uint8Array(16);
@@ -22,10 +17,15 @@ function generateNonce() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Base64 to Base64URL (without padding)
+function base64ToBase64Url(base64) {
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
 // Generate JWT for Coinbase API authentication using Ed25519
 async function generateJWT(keyId, privateKeyBase64) {
   const now = Math.floor(Date.now() / 1000);
-  const expiresIn = 120; // 2 minutes
+  const expiresIn = 120;
   
   // Decode the base64 key (64 bytes: 32 seed + 32 public key)
   const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
@@ -50,54 +50,23 @@ async function generateJWT(keyId, privateKeyBase64) {
     x: xBase64Url,
   };
   
-  // JWT Header
-  const header = {
-    alg: 'EdDSA',
-    kid: keyId,
-    typ: 'JWT',
-    nonce: generateNonce()
-  };
+  // Import the key using jose
+  const key = await importJWK(jwk, 'EdDSA');
   
-  // JWT Payload per Coinbase docs
-  const payload = {
+  // Build JWT claims
+  const claims = {
     sub: keyId,
     iss: 'cdp',
-    iat: now,
-    nbf: now,
-    exp: now + expiresIn,
     uris: [`POST ${API_HOST}/platform/v2/data/query/run`]
   };
   
-  // Encode header and payload
-  const headerB64 = base64ToBase64Url(btoa(JSON.stringify(header)));
-  const payloadB64 = base64ToBase64Url(btoa(JSON.stringify(payload)));
-  const signingInput = `${headerB64}.${payloadB64}`;
-  
-  try {
-    // Import the Ed25519 key using JWK format
-    const key = await crypto.subtle.importKey(
-      'jwk',
-      jwk,
-      { name: 'Ed25519' },
-      false,
-      ['sign']
-    );
-    
-    // Sign the JWT
-    const signature = await crypto.subtle.sign(
-      'Ed25519',
-      key,
-      new TextEncoder().encode(signingInput)
-    );
-    
-    // Encode signature
-    const sigB64 = base64ToBase64Url(btoa(String.fromCharCode(...new Uint8Array(signature))));
-    
-    return `${signingInput}.${sigB64}`;
-  } catch (e) {
-    console.error('JWT signing error:', e);
-    throw new Error(`JWT signing failed: ${e.message}`);
-  }
+  // Sign and return JWT
+  return await new SignJWT(claims)
+    .setProtectedHeader({ alg: 'EdDSA', kid: keyId, typ: 'JWT', nonce: generateNonce() })
+    .setIssuedAt(now)
+    .setNotBefore(now)
+    .setExpirationTime(now + expiresIn)
+    .sign(key);
 }
 
 export default async function handler(request) {
@@ -126,8 +95,7 @@ export default async function handler(request) {
     if (!keyId || !privateKey) {
       return new Response(JSON.stringify({ 
         error: 'Server not configured',
-        hint: 'CDP_KEY_NAME and CDP_PRIVATE_KEY environment variables must be set in Vercel',
-        setup: 'Set CDP_KEY_NAME to the "id" and CDP_PRIVATE_KEY to the "privateKey" from your downloaded cdp_api_key.json'
+        hint: 'Set CDP_KEY_NAME and CDP_PRIVATE_KEY in Vercel environment variables'
       }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -143,30 +111,26 @@ export default async function handler(request) {
       });
     }
 
-    // Generate JWT
+    // Generate JWT using jose library
     let jwt;
     try {
       jwt = await generateJWT(keyId, privateKey);
-      console.log('Generated JWT (first 50 chars):', jwt.substring(0, 50));
     } catch (e) {
       return new Response(JSON.stringify({ 
         error: 'JWT generation failed', 
-        details: e.message,
-        keyIdPresent: !!keyId,
-        privateKeyLength: privateKey?.length
+        details: e.message
       }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Forward to Coinbase SQL API with standard headers
+    // Forward to Coinbase SQL API
     const response = await fetch(COINBASE_SQL_API, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${jwt}`,
-        'User-Agent': 'CDP-SQL-Proxy/1.0',
         'Accept': 'application/json',
       },
       body: JSON.stringify({

@@ -1,12 +1,10 @@
-// Test endpoint to verify JWT generation
+// Test endpoint to verify JWT generation using jose library
+
+import { SignJWT, importJWK, decodeJwt, decodeProtectedHeader } from 'jose';
+
 export const config = {
   runtime: 'edge',
 };
-
-// Base64 to Base64URL conversion
-function base64ToBase64Url(base64) {
-  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
 
 // Generate random hex nonce
 function generateNonce() {
@@ -15,7 +13,12 @@ function generateNonce() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Generate JWT for Coinbase API authentication using Ed25519
+// Base64 to Base64URL (without padding)
+function base64ToBase64Url(base64) {
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// Generate JWT using jose library (same as Coinbase SDK)
 async function generateJWT(keyId, privateKeyBase64) {
   const now = Math.floor(Date.now() / 1000);
   const expiresIn = 120;
@@ -39,43 +42,20 @@ async function generateJWT(keyId, privateKeyBase64) {
     x: xBase64Url,
   };
   
-  const header = {
-    alg: 'EdDSA',
-    kid: keyId,
-    typ: 'JWT',
-    nonce: generateNonce()
-  };
+  const key = await importJWK(jwk, 'EdDSA');
   
-  const payload = {
+  const claims = {
     sub: keyId,
     iss: 'cdp',
-    iat: now,
-    nbf: now,
-    exp: now + expiresIn,
     uris: [`POST api.cdp.coinbase.com/platform/v2/data/query/run`]
   };
   
-  const headerB64 = base64ToBase64Url(btoa(JSON.stringify(header)));
-  const payloadB64 = base64ToBase64Url(btoa(JSON.stringify(payload)));
-  const signingInput = `${headerB64}.${payloadB64}`;
-  
-  const key = await crypto.subtle.importKey(
-    'jwk',
-    jwk,
-    { name: 'Ed25519' },
-    false,
-    ['sign']
-  );
-  
-  const signature = await crypto.subtle.sign(
-    'Ed25519',
-    key,
-    new TextEncoder().encode(signingInput)
-  );
-  
-  const sigB64 = base64ToBase64Url(btoa(String.fromCharCode(...new Uint8Array(signature))));
-  
-  return `${signingInput}.${sigB64}`;
+  return await new SignJWT(claims)
+    .setProtectedHeader({ alg: 'EdDSA', kid: keyId, typ: 'JWT', nonce: generateNonce() })
+    .setIssuedAt(now)
+    .setNotBefore(now)
+    .setExpirationTime(now + expiresIn)
+    .sign(key);
 }
 
 export default async function handler(request) {
@@ -98,17 +78,16 @@ export default async function handler(request) {
 
     const jwt = await generateJWT(keyId, privateKey);
     
-    // Decode and display JWT parts (without signature)
-    const [headerB64, payloadB64] = jwt.split('.');
-    const header = JSON.parse(atob(headerB64.replace(/-/g, '+').replace(/_/g, '/')));
-    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    // Decode JWT parts using jose
+    const header = decodeProtectedHeader(jwt);
+    const payload = decodeJwt(jwt);
     
     return new Response(JSON.stringify({ 
       success: true,
       jwtLength: jwt.length,
       header,
       payload,
-      jwtPreview: jwt.substring(0, 100) + '...'
+      jwt: jwt  // Include full JWT for testing
     }, null, 2), { headers: corsHeaders });
 
   } catch (error) {
