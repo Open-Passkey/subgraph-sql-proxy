@@ -3,8 +3,8 @@ export const config = {
   runtime: 'edge',
 };
 
-// Coinbase SQL API endpoint
-const COINBASE_SQL_API = 'https://api.developer.coinbase.com/platform/v1/sql/query';
+// Coinbase SQL API endpoint (from official docs)
+const COINBASE_SQL_API = 'https://api.cdp.coinbase.com/platform/v2/data/query/run';
 
 export default async function handler(request) {
   const corsHeaders = {
@@ -37,64 +37,51 @@ export default async function handler(request) {
       });
     }
 
-    // Try different API endpoints
-    const endpoints = [
-      'https://api.developer.coinbase.com/platform/v1/sql/query',
-      'https://api.cdp.coinbase.com/platform/v2/data/query/run',
-      'https://api.cdp.coinbase.com/data/sql/v1/query'
-    ];
-
-    let lastError = null;
-    let lastResponse = null;
-
-    for (const endpoint of endpoints) {
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(body),
-        });
-
-        const contentType = response.headers.get('content-type') || '';
-        
-        if (contentType.includes('application/json')) {
-          const data = await response.json();
-          
-          // If successful or got a meaningful error, return it
-          if (response.ok || data.error) {
-            return new Response(JSON.stringify({
-              ...data,
-              _debug: { endpoint, status: response.status }
-            }), {
-              status: response.ok ? 200 : response.status,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            });
-          }
-        } else {
-          // Got HTML or other non-JSON response
-          const text = await response.text();
-          lastError = { endpoint, status: response.status, body: text.substring(0, 200) };
-        }
-      } catch (e) {
-        lastError = { endpoint, error: e.message };
-      }
+    // Validate request has sql field
+    if (!body.sql) {
+      return new Response(JSON.stringify({ error: 'Missing required field: sql' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
     }
 
-    // All endpoints failed
-    return new Response(JSON.stringify({ 
-      error: 'All API endpoints failed',
-      lastError,
-      hint: 'Client API Key may not work for SQL API. Try using Secret API Key from CDP Portal.'
-    }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // Forward to Coinbase SQL API
+    const response = await fetch(COINBASE_SQL_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        sql: body.sql,
+        cache: body.cache || { maxAgeMs: 5000 }
+      }),
     });
 
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      return new Response(JSON.stringify(data), {
+        status: response.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    } else {
+      // Got non-JSON response (likely HTML error page)
+      const text = await response.text();
+      return new Response(JSON.stringify({ 
+        error: 'Coinbase API returned non-JSON response',
+        status: response.status,
+        hint: 'Check if your CDP Client API Key is valid',
+        preview: text.substring(0, 500)
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message, stack: error.stack }), {
+    return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
