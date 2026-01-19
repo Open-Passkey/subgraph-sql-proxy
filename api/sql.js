@@ -125,13 +125,17 @@ export default async function handler(request) {
       });
     }
 
-    // Forward to Coinbase SQL API
+    // Forward to Coinbase SQL API with browser-like headers to pass Cloudflare
     const response = await fetch(COINBASE_SQL_API, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${jwt}`,
         'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://portal.cdp.coinbase.com',
+        'Referer': 'https://portal.cdp.coinbase.com/',
       },
       body: JSON.stringify({
         sql: body.sql,
