@@ -147,22 +147,27 @@ export default async function handler(request) {
     let jwt;
     try {
       jwt = await generateJWT(keyId, privateKey);
+      console.log('Generated JWT (first 50 chars):', jwt.substring(0, 50));
     } catch (e) {
       return new Response(JSON.stringify({ 
         error: 'JWT generation failed', 
-        details: e.message 
+        details: e.message,
+        keyIdPresent: !!keyId,
+        privateKeyLength: privateKey?.length
       }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Forward to Coinbase SQL API
+    // Forward to Coinbase SQL API with standard headers
     const response = await fetch(COINBASE_SQL_API, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${jwt}`,
+        'User-Agent': 'CDP-SQL-Proxy/1.0',
+        'Accept': 'application/json',
       },
       body: JSON.stringify({
         sql: body.sql,
