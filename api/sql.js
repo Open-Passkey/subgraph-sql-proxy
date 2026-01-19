@@ -1,7 +1,7 @@
 // Vercel Edge Function to proxy Coinbase SQL API requests with JWT authentication
 // Set these environment variables in Vercel:
-// - CDP_KEY_NAME: Your CDP API key name (from Portal)
-// - CDP_PRIVATE_KEY: Your CDP private key (PEM format, with \n replaced by actual newlines)
+// - CDP_KEY_NAME: Your CDP API key ID (e.g., "06e27a55-d5f5-4e93-9e16-b33be1493380")
+// - CDP_PRIVATE_KEY: Your CDP private key (base64 string from downloaded JSON)
 
 export const config = {
   runtime: 'edge',
@@ -10,70 +10,75 @@ export const config = {
 const COINBASE_SQL_API = 'https://api.cdp.coinbase.com/platform/v2/data/query/run';
 const API_HOST = 'api.cdp.coinbase.com';
 
-// Generate JWT for Coinbase API authentication
-async function generateJWT(keyName, privateKeyPem) {
+// Base64URL encode helper
+function base64url(data) {
+  if (typeof data === 'string') {
+    data = new TextEncoder().encode(data);
+  } else if (typeof data === 'object' && !(data instanceof Uint8Array)) {
+    data = new TextEncoder().encode(JSON.stringify(data));
+  }
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(data)));
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// Generate JWT for Coinbase API authentication using Ed25519
+async function generateJWT(keyId, privateKeyBase64) {
   const now = Math.floor(Date.now() / 1000);
   
-  // JWT Header
+  // JWT Header for Ed25519
   const header = {
-    alg: 'ES256',
-    kid: keyName,
+    alg: 'EdDSA',
+    kid: keyId,
     typ: 'JWT',
     nonce: crypto.randomUUID()
   };
   
   // JWT Payload per Coinbase docs
   const payload = {
-    sub: keyName,
+    sub: keyId,
     iss: 'cdp',
     nbf: now,
     exp: now + 120,  // 2 minutes
     uri: `POST ${API_HOST}/platform/v2/data/query/run`
   };
   
-  // Base64URL encode
-  const base64url = (obj) => {
-    const json = JSON.stringify(obj);
-    const bytes = new TextEncoder().encode(json);
-    const base64 = btoa(String.fromCharCode(...bytes));
-    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-  };
-  
   const headerB64 = base64url(header);
   const payloadB64 = base64url(payload);
   const signingInput = `${headerB64}.${payloadB64}`;
   
-  // Import private key and sign
   try {
-    // Parse PEM format - handle both EC and PKCS8 formats
-    let pemContents = privateKeyPem
-      .replace('-----BEGIN EC PRIVATE KEY-----', '')
-      .replace('-----END EC PRIVATE KEY-----', '')
-      .replace('-----BEGIN PRIVATE KEY-----', '')
-      .replace('-----END PRIVATE KEY-----', '')
-      .replace(/\\n/g, '')
-      .replace(/\s/g, '');
+    // Decode the base64 private key
+    // CDP Ed25519 keys are 64 bytes: 32-byte seed + 32-byte public key
+    const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
     
-    const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+    // Extract the 32-byte seed (first half)
+    const seed = keyBytes.slice(0, 32);
+    
+    // Import as Ed25519 private key using PKCS8 format
+    // We need to wrap the seed in PKCS8 format for Web Crypto
+    const pkcs8Prefix = new Uint8Array([
+      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+      0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+    ]);
+    const pkcs8Key = new Uint8Array(pkcs8Prefix.length + seed.length);
+    pkcs8Key.set(pkcs8Prefix);
+    pkcs8Key.set(seed, pkcs8Prefix.length);
     
     const key = await crypto.subtle.importKey(
       'pkcs8',
-      binaryDer,
-      { name: 'ECDSA', namedCurve: 'P-256' },
+      pkcs8Key,
+      { name: 'Ed25519' },
       false,
       ['sign']
     );
     
     const signature = await crypto.subtle.sign(
-      { name: 'ECDSA', hash: 'SHA-256' },
+      'Ed25519',
       key,
       new TextEncoder().encode(signingInput)
     );
     
-    // Convert DER signature to raw R||S format for ES256
-    const sigArray = new Uint8Array(signature);
-    const sigB64 = btoa(String.fromCharCode(...sigArray))
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const sigB64 = base64url(new Uint8Array(signature));
     
     return `${signingInput}.${sigB64}`;
   } catch (e) {
@@ -102,14 +107,14 @@ export default async function handler(request) {
 
   try {
     // Get credentials from environment variables
-    const keyName = process.env.CDP_KEY_NAME;
+    const keyId = process.env.CDP_KEY_NAME;
     const privateKey = process.env.CDP_PRIVATE_KEY;
     
-    if (!keyName || !privateKey) {
+    if (!keyId || !privateKey) {
       return new Response(JSON.stringify({ 
         error: 'Server not configured',
         hint: 'CDP_KEY_NAME and CDP_PRIVATE_KEY environment variables must be set in Vercel',
-        setup: 'Go to Vercel → Settings → Environment Variables and add your CDP Secret API Key credentials'
+        setup: 'Set CDP_KEY_NAME to the "id" and CDP_PRIVATE_KEY to the "privateKey" from your downloaded cdp_api_key.json'
       }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -128,7 +133,7 @@ export default async function handler(request) {
     // Generate JWT
     let jwt;
     try {
-      jwt = await generateJWT(keyName, privateKey);
+      jwt = await generateJWT(keyId, privateKey);
     } catch (e) {
       return new Response(JSON.stringify({ 
         error: 'JWT generation failed', 
