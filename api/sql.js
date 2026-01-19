@@ -1,19 +1,94 @@
-// Vercel Edge Function to proxy Coinbase SQL API requests
+// Vercel Edge Function to proxy Coinbase SQL API requests with JWT authentication
+// Set these environment variables in Vercel:
+// - CDP_KEY_NAME: Your CDP API key name (from Portal)
+// - CDP_PRIVATE_KEY: Your CDP private key (PEM format, with \n replaced by actual newlines)
+
 export const config = {
   runtime: 'edge',
 };
 
-// Coinbase SQL API endpoint (from official docs)
 const COINBASE_SQL_API = 'https://api.cdp.coinbase.com/platform/v2/data/query/run';
+const API_HOST = 'api.cdp.coinbase.com';
+
+// Generate JWT for Coinbase API authentication
+async function generateJWT(keyName, privateKeyPem) {
+  const now = Math.floor(Date.now() / 1000);
+  
+  // JWT Header
+  const header = {
+    alg: 'ES256',
+    kid: keyName,
+    typ: 'JWT',
+    nonce: crypto.randomUUID()
+  };
+  
+  // JWT Payload per Coinbase docs
+  const payload = {
+    sub: keyName,
+    iss: 'cdp',
+    nbf: now,
+    exp: now + 120,  // 2 minutes
+    uri: `POST ${API_HOST}/platform/v2/data/query/run`
+  };
+  
+  // Base64URL encode
+  const base64url = (obj) => {
+    const json = JSON.stringify(obj);
+    const bytes = new TextEncoder().encode(json);
+    const base64 = btoa(String.fromCharCode(...bytes));
+    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  };
+  
+  const headerB64 = base64url(header);
+  const payloadB64 = base64url(payload);
+  const signingInput = `${headerB64}.${payloadB64}`;
+  
+  // Import private key and sign
+  try {
+    // Parse PEM format - handle both EC and PKCS8 formats
+    let pemContents = privateKeyPem
+      .replace('-----BEGIN EC PRIVATE KEY-----', '')
+      .replace('-----END EC PRIVATE KEY-----', '')
+      .replace('-----BEGIN PRIVATE KEY-----', '')
+      .replace('-----END PRIVATE KEY-----', '')
+      .replace(/\\n/g, '')
+      .replace(/\s/g, '');
+    
+    const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+    
+    const key = await crypto.subtle.importKey(
+      'pkcs8',
+      binaryDer,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['sign']
+    );
+    
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      new TextEncoder().encode(signingInput)
+    );
+    
+    // Convert DER signature to raw R||S format for ES256
+    const sigArray = new Uint8Array(signature);
+    const sigB64 = btoa(String.fromCharCode(...sigArray))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    
+    return `${signingInput}.${sigB64}`;
+  } catch (e) {
+    console.error('JWT signing error:', e);
+    throw new Error(`JWT signing failed: ${e.message}`);
+  }
+}
 
 export default async function handler(request) {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key',
+    'Access-Control-Allow-Headers': 'Content-Type',
   };
 
-  // Handle CORS preflight
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
@@ -26,21 +101,40 @@ export default async function handler(request) {
   }
 
   try {
-    const body = await request.json();
-    const authHeader = request.headers.get('Authorization');
-    const apiKey = request.headers.get('X-Api-Key') || (authHeader ? authHeader.replace('Bearer ', '') : null);
-
-    if (!apiKey) {
-      return new Response(JSON.stringify({ error: 'API Key required (Authorization header or X-Api-Key)' }), {
-        status: 401,
+    // Get credentials from environment variables
+    const keyName = process.env.CDP_KEY_NAME;
+    const privateKey = process.env.CDP_PRIVATE_KEY;
+    
+    if (!keyName || !privateKey) {
+      return new Response(JSON.stringify({ 
+        error: 'Server not configured',
+        hint: 'CDP_KEY_NAME and CDP_PRIVATE_KEY environment variables must be set in Vercel',
+        setup: 'Go to Vercel → Settings → Environment Variables and add your CDP Secret API Key credentials'
+      }), {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Validate request has sql field
+    const body = await request.json();
+
     if (!body.sql) {
       return new Response(JSON.stringify({ error: 'Missing required field: sql' }), {
         status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Generate JWT
+    let jwt;
+    try {
+      jwt = await generateJWT(keyName, privateKey);
+    } catch (e) {
+      return new Response(JSON.stringify({ 
+        error: 'JWT generation failed', 
+        details: e.message 
+      }), {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
@@ -50,7 +144,7 @@ export default async function handler(request) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        'Authorization': `Bearer ${jwt}`,
       },
       body: JSON.stringify({
         sql: body.sql,
@@ -67,15 +161,13 @@ export default async function handler(request) {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     } else {
-      // Got non-JSON response (likely HTML error page)
       const text = await response.text();
       return new Response(JSON.stringify({ 
         error: 'Coinbase API returned non-JSON response',
         status: response.status,
-        hint: 'Check if your CDP Client API Key is valid',
         preview: text.substring(0, 500)
       }), {
-        status: 500,
+        status: response.status,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
