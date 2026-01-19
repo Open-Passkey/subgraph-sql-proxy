@@ -10,75 +10,88 @@ export const config = {
 const COINBASE_SQL_API = 'https://api.cdp.coinbase.com/platform/v2/data/query/run';
 const API_HOST = 'api.cdp.coinbase.com';
 
-// Base64URL encode helper
-function base64url(data) {
-  if (typeof data === 'string') {
-    data = new TextEncoder().encode(data);
-  } else if (typeof data === 'object' && !(data instanceof Uint8Array)) {
-    data = new TextEncoder().encode(JSON.stringify(data));
-  }
-  const base64 = btoa(String.fromCharCode(...new Uint8Array(data)));
+// Base64 to Base64URL conversion
+function base64ToBase64Url(base64) {
   return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// Generate random hex nonce
+function generateNonce() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // Generate JWT for Coinbase API authentication using Ed25519
 async function generateJWT(keyId, privateKeyBase64) {
   const now = Math.floor(Date.now() / 1000);
+  const expiresIn = 120; // 2 minutes
   
-  // JWT Header for Ed25519
+  // Decode the base64 key (64 bytes: 32 seed + 32 public key)
+  const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
+  
+  if (keyBytes.length !== 64) {
+    throw new Error(`Invalid Ed25519 key length: expected 64 bytes, got ${keyBytes.length}`);
+  }
+  
+  // Extract seed (first 32 bytes) and public key (last 32 bytes)
+  const seed = keyBytes.slice(0, 32);
+  const publicKey = keyBytes.slice(32);
+  
+  // Convert to base64url for JWK
+  const dBase64Url = base64ToBase64Url(btoa(String.fromCharCode(...seed)));
+  const xBase64Url = base64ToBase64Url(btoa(String.fromCharCode(...publicKey)));
+  
+  // Create JWK (JSON Web Key) format for Ed25519
+  const jwk = {
+    kty: 'OKP',
+    crv: 'Ed25519',
+    d: dBase64Url,
+    x: xBase64Url,
+  };
+  
+  // JWT Header
   const header = {
     alg: 'EdDSA',
     kid: keyId,
     typ: 'JWT',
-    nonce: crypto.randomUUID()
+    nonce: generateNonce()
   };
   
   // JWT Payload per Coinbase docs
   const payload = {
     sub: keyId,
     iss: 'cdp',
+    iat: now,
     nbf: now,
-    exp: now + 120,  // 2 minutes
-    uri: `POST ${API_HOST}/platform/v2/data/query/run`
+    exp: now + expiresIn,
+    uris: [`POST ${API_HOST}/platform/v2/data/query/run`]
   };
   
-  const headerB64 = base64url(header);
-  const payloadB64 = base64url(payload);
+  // Encode header and payload
+  const headerB64 = base64ToBase64Url(btoa(JSON.stringify(header)));
+  const payloadB64 = base64ToBase64Url(btoa(JSON.stringify(payload)));
   const signingInput = `${headerB64}.${payloadB64}`;
   
   try {
-    // Decode the base64 private key
-    // CDP Ed25519 keys are 64 bytes: 32-byte seed + 32-byte public key
-    const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
-    
-    // Extract the 32-byte seed (first half)
-    const seed = keyBytes.slice(0, 32);
-    
-    // Import as Ed25519 private key using PKCS8 format
-    // We need to wrap the seed in PKCS8 format for Web Crypto
-    const pkcs8Prefix = new Uint8Array([
-      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
-      0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
-    ]);
-    const pkcs8Key = new Uint8Array(pkcs8Prefix.length + seed.length);
-    pkcs8Key.set(pkcs8Prefix);
-    pkcs8Key.set(seed, pkcs8Prefix.length);
-    
+    // Import the Ed25519 key using JWK format
     const key = await crypto.subtle.importKey(
-      'pkcs8',
-      pkcs8Key,
+      'jwk',
+      jwk,
       { name: 'Ed25519' },
       false,
       ['sign']
     );
     
+    // Sign the JWT
     const signature = await crypto.subtle.sign(
       'Ed25519',
       key,
       new TextEncoder().encode(signingInput)
     );
     
-    const sigB64 = base64url(new Uint8Array(signature));
+    // Encode signature
+    const sigB64 = base64ToBase64Url(btoa(String.fromCharCode(...new Uint8Array(signature))));
     
     return `${signingInput}.${sigB64}`;
   } catch (e) {
